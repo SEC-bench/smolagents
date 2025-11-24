@@ -162,6 +162,10 @@ def check_safer_result(result: Any, static_tools: dict[str, Callable] = None, au
     Raises:
         InterpreterError: If the result is not safe
     """
+    # Skip all checks if sandbox is disabled (indicated by "*" in authorized_imports)
+    if authorized_imports and "*" in authorized_imports:
+        return
+
     if isinstance(result, ModuleType):
         if not check_import_authorized(result.__name__, authorized_imports):
             raise InterpreterError(f"Forbidden access to module: {result.__name__}")
@@ -340,8 +344,10 @@ def evaluate_attribute(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
-    if expression.attr.startswith("__") and expression.attr.endswith("__"):
-        raise InterpreterError(f"Forbidden access to dunder attribute: {expression.attr}")
+    # Skip dunder attribute check if sandbox is disabled (indicated by "*" in authorized_imports)
+    if not (authorized_imports and "*" in authorized_imports):
+        if expression.attr.startswith("__") and expression.attr.endswith("__"):
+            raise InterpreterError(f"Forbidden access to dunder attribute: {expression.attr}")
     value = evaluate_ast(expression.value, state, static_tools, custom_tools, authorized_imports)
     return getattr(value, expression.attr)
 
@@ -856,18 +862,24 @@ def evaluate_call(
         state["_print_outputs"] += " ".join(map(str, args)) + "\n"
         return None
     else:  # Assume it's a callable object
-        if (inspect.getmodule(func) == builtins) and inspect.isbuiltin(func) and (func not in static_tools.values()):
-            raise InterpreterError(
-                f"Invoking a builtin function that has not been explicitly added as a tool is not allowed ({func_name})."
-            )
-        if (
-            hasattr(func, "__name__")
-            and func.__name__.startswith("__")
-            and func.__name__.endswith("__")
-            and (func.__name__ not in static_tools)
-            and (func.__name__ not in ALLOWED_DUNDER_METHODS)
-        ):
-            raise InterpreterError(f"Forbidden call to dunder function: {func.__name__}")
+        # Skip builtin and dunder function checks if sandbox is disabled (indicated by "*" in authorized_imports)
+        if not (authorized_imports and "*" in authorized_imports):
+            if (
+                (inspect.getmodule(func) == builtins)
+                and inspect.isbuiltin(func)
+                and (func not in static_tools.values())
+            ):
+                raise InterpreterError(
+                    f"Invoking a builtin function that has not been explicitly added as a tool is not allowed ({func_name})."
+                )
+            if (
+                hasattr(func, "__name__")
+                and func.__name__.startswith("__")
+                and func.__name__.endswith("__")
+                and (func.__name__ not in static_tools)
+                and (func.__name__ not in ALLOWED_DUNDER_METHODS)
+            ):
+                raise InterpreterError(f"Forbidden call to dunder function: {func.__name__}")
         return func(*args, **kwargs)
 
 
