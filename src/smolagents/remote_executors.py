@@ -493,6 +493,359 @@ class DockerExecutor(RemotePythonExecutor):
                 retries += 1
 
 
+class DockerAgentRuntime:
+    """
+    Run the entire agentic system inside a Docker container using a prebuilt image.
+
+    This runtime is different from DockerExecutor (which only sandboxes code snippets).
+    Here we start a container from a provided image, copy a config file and an
+    in-container runner script, then execute it. The runner is expected to:
+      - reconstruct agents (including managed agents)
+      - run the given task
+      - emit trajectory logs to an artifacts directory
+
+    Args:
+        image_name (str): Prebuilt Docker image to run.
+        workdir (str): Path inside the container to use as working directory.
+        artifacts_dir (str): Host directory to store outputs (trajectory, logs, final output).
+        command (list[str] | None): Optional override command to run in the container.
+        environment (dict[str, str] | None): Environment variables to pass (e.g., HF_TOKEN).
+        runtime_logger: Logger with .log / .log_error methods.
+        docker_run_kwargs (dict | None): Extra kwargs forwarded to docker.containers.run.
+    """
+
+    def __init__(
+        self,
+        image_name: str,
+        workdir: str = "/app",
+        artifacts_dir: str | None = None,
+        command: list[str] | None = None,
+        environment: dict[str, str] | None = None,
+        runtime_logger=None,
+        docker_run_kwargs: dict[str, Any] | None = None,
+    ):
+        try:
+            import docker
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError(
+                "Please install 'docker' extra to use DockerAgentRuntime: `pip install 'smolagents[docker]'`"
+            )
+
+        self.image_name = image_name
+        self.workdir = workdir
+        self.artifacts_dir = artifacts_dir or os.path.join(os.getcwd(), "agent_artifacts")
+        self.environment = environment or {}
+        # Default to a keepalive command if none provided.
+        self.command = command or ["tail", "-f", "/dev/null"]
+        self.logger = runtime_logger
+        self.docker_run_kwargs = docker_run_kwargs or {}
+        self.client = docker.from_env()
+        self.container = None
+
+        # Ensure artifacts dir exists
+        os.makedirs(self.artifacts_dir, exist_ok=True)
+
+    # _log implemented at end of class with stdout fallback
+
+    def start(self) -> None:
+        # Mount artifacts dir and run in detached mode
+        volumes = self.docker_run_kwargs.pop("volumes", {})
+
+        # Create subdirectories for different artifact types
+        # Use "output" as base directory to distinguish from other artifacts
+        testcase_dir = os.path.join(self.artifacts_dir, "testcase")
+        artifacts_subdir = os.path.join(self.artifacts_dir, "artifacts")
+        os.makedirs(testcase_dir, exist_ok=True)
+        os.makedirs(artifacts_subdir, exist_ok=True)
+
+        # Mount /testcase directory to capture all test artifacts (e.g., poc.js)
+        volumes[testcase_dir] = {"bind": "/testcase", "mode": "rw"}
+
+        # Mount /app/artifacts directory to capture artifacts as instructed in prompts
+        # This also serves as the runner's artifacts directory
+        # Note: artifacts_dir is set to instance_output_dir / "output", so artifacts_subdir = output/artifacts
+        volumes[artifacts_subdir] = {"bind": "/app/artifacts", "mode": "rw"}
+
+        # Always run detached to allow streaming logs
+        run_kwargs = {
+            "detach": True,
+            "tty": True,
+            "working_dir": self.workdir,
+            "environment": self.environment,
+            "volumes": volumes,
+        }
+
+        # Handle auto_remove - if True, set remove=True, but we'll manage cleanup manually
+        auto_remove = self.docker_run_kwargs.pop("auto_remove", False)
+        if auto_remove:
+            # Note: We don't set remove=True here because we want to control cleanup
+            # The cleanup() method will handle removal
+            pass
+
+        # Handle network_mode
+        if "network_mode" in self.docker_run_kwargs:
+            run_kwargs["network_mode"] = self.docker_run_kwargs.pop("network_mode")
+
+        # Handle mem_limit
+        if "mem_limit" in self.docker_run_kwargs:
+            run_kwargs["mem_limit"] = self.docker_run_kwargs.pop("mem_limit")
+
+        run_kwargs.update(self.docker_run_kwargs)
+
+        # Propagate host terminal width to container for Rich rendering
+        try:
+            import shutil
+
+            cols, _ = shutil.get_terminal_size(fallback=(120, 40))
+            env = run_kwargs.get("environment", {}) or {}
+            env.setdefault("TERM_WIDTH", str(cols))
+            run_kwargs["environment"] = env
+        except Exception:
+            pass
+
+        # Expose image name to container so runner can include it in meta.json
+        run_kwargs["environment"]["DOCKER_IMAGE"] = self.image_name
+        self._log(f"Starting agent container from image '{self.image_name}'...")
+        self._log(f"Volume mounts: /testcase -> {testcase_dir}, /app/artifacts -> {artifacts_subdir}")
+        self.container = self.client.containers.run(self.image_name, *self.command, **run_kwargs)
+
+    def exec(self, args: list[str]) -> int:
+        """Exec command inside the running container, return exit code."""
+        assert self.container is not None, "Container not started"
+        exec_result = self.container.exec_run(args, workdir=self.workdir, stream=False)
+        if exec_result.output:
+            # Try to log as text
+            try:
+                self._log(exec_result.output.decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+        return exec_result.exit_code
+
+    def stream_logs(self) -> None:
+        assert self.container is not None, "Container not started"
+        for line in self.container.logs(stream=True, follow=True):
+            try:
+                self._log(line.decode("utf-8", errors="ignore").rstrip())
+            except Exception:
+                pass
+
+    def get_logs(self, tail: int | None = None) -> str:
+        """Fetch container logs once (no follow)."""
+        assert self.container is not None, "Container not started"
+        logs = self.container.logs(stream=False, tail=tail)
+        try:
+            return logs.decode("utf-8", errors="ignore") if isinstance(logs, (bytes, bytearray)) else str(logs)
+        except Exception:
+            return str(logs)
+
+    def run_agent(
+        self,
+        agent_runner_path_in_container: str,
+        agent_config_path_in_container: str,
+        task: str,
+        max_steps: int | None = None,
+        timeout_seconds: int | None = None,
+        stream: bool = True,
+    ) -> int:
+        """
+        Invoke the in-container runner with a config file and task. The runner
+        should write artifacts to workdir/artifacts, including trajectory.jsonl and output.json.
+        """
+        cmd = [
+            "python",
+            agent_runner_path_in_container,
+            "--config",
+            agent_config_path_in_container,
+            "--task",
+            task,
+            "--artifacts-dir",
+            os.path.join(self.workdir, "artifacts"),
+        ]
+        if max_steps is not None:
+            cmd += ["--max-steps", str(max_steps)]
+
+        # Helper to run and (optionally) stream output from exec
+        def _run_and_stream() -> int:
+            assert self.container is not None
+            # Use low-level API to stream exec output in real-time with TTY for colors
+            exec_id = self.client.api.exec_create(  # type: ignore
+                self.container.id,
+                cmd=cmd,
+                workdir=self.workdir,
+                tty=True,
+                stdout=True,
+                stderr=True,
+                environment=self.environment,
+            )["Id"]
+            output = self.client.api.exec_start(exec_id, stream=True, demux=True)  # type: ignore
+            if stream:
+                import sys
+
+                for chunk in output:
+                    if not chunk:
+                        continue
+                    out, err = chunk
+                    if out:
+                        try:
+                            sys.stdout.write(out.decode("utf-8", errors="ignore"))
+                            sys.stdout.flush()
+                        except Exception:
+                            pass
+                    if err:
+                        try:
+                            sys.stderr.write(err.decode("utf-8", errors="ignore"))
+                            sys.stderr.flush()
+                        except Exception:
+                            pass
+            else:
+                # Drain output without printing
+                for _ in output:
+                    pass
+            inspect = self.client.api.exec_inspect(exec_id)  # type: ignore
+            return int(inspect.get("ExitCode", 1))
+
+        if not timeout_seconds:
+            return _run_and_stream()
+
+        # Execute with timeout using a background thread
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_run_and_stream)
+            try:
+                return future.result(timeout=timeout_seconds)
+            except TimeoutError:
+                self._log(
+                    f"Agent run exceeded timeout of {timeout_seconds} seconds. Stopping container...",
+                    level=LogLevel.INFO,
+                )
+                try:
+                    if self.container is not None:
+                        self.container.stop()
+                except Exception:
+                    pass
+                return 124
+
+    def copy_into_container(self, src_path: str, dst_path_in_container: str) -> None:
+        """Copy a local file or directory into container at destination path."""
+        assert self.container is not None, "Container not started"
+        import tarfile
+        from io import BytesIO
+
+        data = BytesIO()
+        with tarfile.open(fileobj=data, mode="w") as tar:
+            tar.add(src_path, arcname=os.path.basename(dst_path_in_container))
+        data.seek(0)
+        self.container.put_archive(os.path.dirname(dst_path_in_container), data.read())
+
+    def copy_from_container(self, src_path_in_container: str, dst_path: str) -> None:
+        """Copy a file or directory from container to host at destination path."""
+        assert self.container is not None, "Container not started"
+        import tarfile
+        from io import BytesIO
+
+        bits, stat = self.container.get_archive(src_path_in_container)
+        data = BytesIO()
+        for chunk in bits:
+            data.write(chunk)
+        data.seek(0)
+
+        with tarfile.open(fileobj=data, mode="r") as tar:
+            tar.extractall(path=os.path.dirname(dst_path))
+
+    def install_local_smolagents(self, host_repo_root: str, container_src_dir: str | None = None) -> None:
+        """
+        Copy local repository sources into the container and install smolagents via pip.
+
+        Only Python (>=3.12) is assumed to be present in the image.
+        """
+        assert self.container is not None, "Container not started"
+        container_src_dir = container_src_dir or os.path.join(self.workdir, "smolagents_src")
+
+        # Ensure target dir exists without requiring bash
+        self.exec(["python", "-c", f"import os; os.makedirs('{container_src_dir}', exist_ok=True)"])
+
+        # Copy minimal build context: pyproject.toml and src/
+        pyproject_path = os.path.join(host_repo_root, "pyproject.toml")
+        src_dir_path = os.path.join(host_repo_root, "src")
+        if not os.path.exists(pyproject_path) or not os.path.isdir(src_dir_path):
+            raise FileNotFoundError(f"Could not find pyproject.toml or src/ in repo root: {host_repo_root}")
+
+        self._log("Copying local smolagents sources into container...")
+        self.copy_into_container(pyproject_path, os.path.join(container_src_dir, "pyproject.toml"))
+        self.copy_into_container(src_dir_path, os.path.join(container_src_dir, "src"))
+
+        # Ensure pip is available and upgraded, then install from local sources
+        self._log("Installing smolagents inside container from local sources...")
+        ensure_pip_cmds = [
+            ["python", "-m", "ensurepip", "--upgrade"],
+            ["python", "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+        ]
+        for cmd in ensure_pip_cmds:
+            self.exec(cmd)
+
+        # Uninstall existing smolagents to ensure clean state
+        self._log("Uninstalling existing smolagents if present...")
+        self.exec(["python", "-m", "pip", "uninstall", "-y", "smolagents"])
+
+        # Clear Python bytecode cache to prevent stale .pyc files
+        self._log("Clearing Python bytecode cache...")
+        self.exec(
+            [
+                "python",
+                "-c",
+                "import shutil, pathlib; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('/usr/local/lib').rglob('__pycache__')]",
+            ]
+        )
+        self.exec(
+            [
+                "python",
+                "-c",
+                "import shutil, pathlib; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('/usr/lib').rglob('__pycache__')]",
+            ]
+        )
+
+        # Install local package with hard-coded extras to ensure provider/tool capabilities are present
+        # Include 'secb' extra for SEC-bench evaluation (provides datasets package)
+        # Use --force-reinstall to ensure local version replaces any pip-installed version
+        # Use --no-cache-dir to ensure fresh installation
+        install_target = f"{container_src_dir}[litellm,toolkit,mcp,secb]"
+        install_code = self.exec(
+            ["python", "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", install_target]
+        )
+        if install_code != 0:
+            raise RuntimeError("Failed to install smolagents inside container from local sources")
+
+    def cleanup(self) -> None:
+        try:
+            if self.container is not None:
+                self._log("Stopping agent container...", level=LogLevel.INFO)
+                try:
+                    self.container.stop(timeout=10)
+                except Exception as e:
+                    self._log(f"Error stopping container: {e}", level=LogLevel.INFO)
+                try:
+                    self.container.remove()
+                except Exception as e:
+                    self._log(f"Error removing container: {e}", level=LogLevel.INFO)
+        except Exception as e:
+            if self.logger is not None:
+                self.logger.log_error(f"Error during cleanup: {e}")
+        finally:
+            self.container = None
+
+    def _log(self, msg: str, level: LogLevel = LogLevel.INFO):
+        # Dim host/setup logs to distinguish from container agent outputs
+        dimmed_msg = f"\x1b[2m{msg}\x1b[0m"
+        if self.logger is None:
+            try:
+                print(dimmed_msg)
+            except Exception:
+                pass
+            return
+        self.logger.log(dimmed_msg, level=level)
+
+
 class ModalExecutor(RemotePythonExecutor):
     """
     Executes Python code using Modal.
