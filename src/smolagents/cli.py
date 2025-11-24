@@ -440,10 +440,26 @@ def _process_secb_instance(
         # Start container
         runtime.start()
 
-        # Install local smolagents source to ensure CmdTool and other local changes are available
-        # Find the repository root (assuming cli.py is in src/smolagents/)
+        # Install smolagents - try local first, then fall back to git
+        # Get installation config from docker_config
+        smolagents_git_url = docker_config.get("smolagents_git_url", "https://github.com/SEC-bench/smolagents.git")
+        smolagents_git_branch = docker_config.get("smolagents_git_branch")
+
+        # Try to find local repository root (assuming cli.py is in src/smolagents/)
+        # Check if we're running from a local development repo
         repo_root = Path(__file__).parent.parent.parent
-        runtime.install_local_smolagents(str(repo_root))
+        pyproject_path = repo_root / "pyproject.toml"
+        src_dir_path = repo_root / "src"
+        local_repo_root = (
+            str(repo_root) if (pyproject_path.exists() and src_dir_path.exists() and src_dir_path.is_dir()) else None
+        )
+
+        # Use unified installation method that handles both local and git
+        runtime.install_smolagents(
+            host_repo_root=local_repo_root,
+            git_url=smolagents_git_url,
+            git_branch=smolagents_git_branch,
+        )
 
         # Copy runner script from source directory
         runner_script_path = Path(__file__).parent / "docker_app_runner.py"

@@ -816,6 +816,96 @@ class DockerAgentRuntime:
         if install_code != 0:
             raise RuntimeError("Failed to install smolagents inside container from local sources")
 
+    def install_smolagents_from_git(
+        self, git_url: str = "https://github.com/SEC-bench/smolagents.git", branch: str | None = None
+    ) -> None:
+        """
+        Install smolagents from a git repository inside the container.
+
+        Args:
+            git_url: Git repository URL (supports both SSH and HTTPS)
+            branch: Optional branch/tag/commit to checkout. If None, uses default branch.
+        """
+        assert self.container is not None, "Container not started"
+
+        # Ensure pip is available and upgraded
+        self._log("Ensuring pip is available and upgraded...")
+        ensure_pip_cmds = [
+            ["python", "-m", "ensurepip", "--upgrade"],
+            ["python", "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+        ]
+        for cmd in ensure_pip_cmds:
+            self.exec(cmd)
+
+        # Uninstall existing smolagents to ensure clean state
+        self._log("Uninstalling existing smolagents if present...")
+        self.exec(["python", "-m", "pip", "uninstall", "-y", "smolagents"])
+
+        # Clear Python bytecode cache to prevent stale .pyc files
+        self._log("Clearing Python bytecode cache...")
+        self.exec(
+            [
+                "python",
+                "-c",
+                "import shutil, pathlib; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('/usr/local/lib').rglob('__pycache__')]",
+            ]
+        )
+        self.exec(
+            [
+                "python",
+                "-c",
+                "import shutil, pathlib; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('/usr/lib').rglob('__pycache__')]",
+            ]
+        )
+
+        # Build install target with git URL and optional branch
+        # pip supports git+ URLs directly - it will handle git internally
+        # Format: git+https://github.com/user/repo.git@branch#egg=package[extras]
+        install_target = git_url
+        if branch:
+            install_target = f"{git_url}@{branch}"
+        install_target_with_extras = f"git+{install_target}#egg=smolagents[litellm,toolkit,mcp,secb]"
+
+        self._log(f"Installing smolagents from git repository: {git_url}" + (f" (branch: {branch})" if branch else ""))
+        install_code = self.exec(
+            ["python", "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", install_target_with_extras]
+        )
+        if install_code != 0:
+            raise RuntimeError(f"Failed to install smolagents from git repository: {git_url}")
+
+    def install_smolagents(
+        self,
+        host_repo_root: str | None = None,
+        git_url: str | None = None,
+        git_branch: str | None = None,
+        container_src_dir: str | None = None,
+    ) -> None:
+        """
+        Install smolagents in the container, trying local installation first, then falling back to git.
+
+        Args:
+            host_repo_root: Path to local smolagents repository root. If None or doesn't exist, falls back to git.
+            git_url: Git repository URL for fallback installation. Defaults to SEC-bench fork.
+            git_branch: Optional branch/tag/commit to checkout when using git installation.
+            container_src_dir: Directory inside container for local installation (only used if host_repo_root is provided).
+        """
+        # Try local installation first if host_repo_root is provided
+        if host_repo_root:
+            pyproject_path = os.path.join(host_repo_root, "pyproject.toml")
+            src_dir_path = os.path.join(host_repo_root, "src")
+            if os.path.exists(pyproject_path) and os.path.isdir(src_dir_path):
+                self._log("Local smolagents repository found, using local installation...")
+                self.install_local_smolagents(host_repo_root, container_src_dir)
+                return
+
+        # Fall back to git installation
+        if git_url is None:
+            # Default to SEC-bench fork, but allow HTTPS fallback if SSH fails
+            git_url = "https://github.com/SEC-bench/smolagents.git"
+
+        self._log("Local smolagents repository not found, installing from git...")
+        self.install_smolagents_from_git(git_url, git_branch)
+
     def cleanup(self) -> None:
         try:
             if self.container is not None:
