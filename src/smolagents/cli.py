@@ -431,7 +431,7 @@ def _process_secb_instance(
     runtime = DockerAgentRuntime(
         image_name=docker_image,
         workdir=workdir,
-        artifacts_dir=str(instance_output_dir / "output"),
+        artifacts_dir=str(instance_output_dir),
         runtime_logger=logger,
         docker_run_kwargs=docker_kwargs,
     )
@@ -504,16 +504,16 @@ def _process_secb_instance(
         _collect_artifacts(instance, instance_output_dir, task_type, runtime)
 
         # Copy meta.json from container's artifacts directory if it exists
-        # Note: artifacts_dir is set to instance_output_dir / "output"
-        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "output" / "artifacts"
+        # Note: artifacts_dir is set to instance_output_dir
+        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "artifacts"
         # /app/artifacts is mounted to artifacts_subdir
-        meta_json_source = instance_output_dir / "output" / "artifacts" / "meta.json"
+        meta_json_source = instance_output_dir / "artifacts" / "meta.json"
         if meta_json_source.exists():
             meta_json_dest = instance_output_dir / "meta.json"
             shutil.copy2(meta_json_source, meta_json_dest)
 
         # Save result
-        _save_result(instance_id, instance_output_dir, exit_code, task_type)
+        _save_result(instance_id, instance_output_dir, output_dir, exit_code, task_type)
 
     except Exception as e:
         console.print(f"[red]Error processing {instance_id}: {e}[/]")
@@ -630,10 +630,10 @@ def _collect_artifacts(
         )
 
         # Read base64 content from mounted artifacts directory
-        # Note: artifacts_dir is set to instance_output_dir / "output"
-        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "output" / "artifacts"
+        # Note: artifacts_dir is set to instance_output_dir
+        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "artifacts"
         # /app/artifacts is mounted to artifacts_subdir
-        poc_file = instance_output_dir / "output" / "artifacts" / "poc.tar.gz.base64"
+        poc_file = instance_output_dir / "artifacts" / "poc.tar.gz.base64"
         if poc_file.exists():
             with poc_file.open() as f:
                 poc_content = f.read().strip()
@@ -648,6 +648,7 @@ def _collect_artifacts(
 def _save_result(
     instance_id: str,
     instance_output_dir: Path,
+    root_output_dir: Path,
     exit_code: int,
     task_type: str,
 ) -> None:
@@ -679,9 +680,9 @@ def _save_result(
             "poc_artifact": poc_artifact,
         }
 
-    # Save as JSONL (compatible with eval_instances.py)
-    output_file = instance_output_dir / "output.jsonl"
-    with output_file.open("w") as f:
+    # Append to comprehensive output.jsonl in root directory
+    output_file = root_output_dir / "output.jsonl"
+    with output_file.open("a") as f:
         f.write(json.dumps(result) + "\n")
 
 

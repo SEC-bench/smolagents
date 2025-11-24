@@ -552,7 +552,7 @@ class DockerAgentRuntime:
         volumes = self.docker_run_kwargs.pop("volumes", {})
 
         # Create subdirectories for different artifact types
-        # Use "output" as base directory to distinguish from other artifacts
+        # artifacts_dir is set to instance_output_dir, so we create testcase and artifacts subdirectories directly
         testcase_dir = os.path.join(self.artifacts_dir, "testcase")
         artifacts_subdir = os.path.join(self.artifacts_dir, "artifacts")
         os.makedirs(testcase_dir, exist_ok=True)
@@ -563,7 +563,7 @@ class DockerAgentRuntime:
 
         # Mount /app/artifacts directory to capture artifacts as instructed in prompts
         # This also serves as the runner's artifacts directory
-        # Note: artifacts_dir is set to instance_output_dir / "output", so artifacts_subdir = output/artifacts
+        # Note: artifacts_dir is set to instance_output_dir, so artifacts_subdir = instance_output_dir / "artifacts"
         volumes[artifacts_subdir] = {"bind": "/app/artifacts", "mode": "rw"}
 
         # Always run detached to allow streaming logs
@@ -659,7 +659,7 @@ class DockerAgentRuntime:
             "--task",
             task,
             "--artifacts-dir",
-            os.path.join(self.workdir, "artifacts"),
+            os.path.join("/app", "artifacts"),
         ]
         if max_steps is not None:
             cmd += ["--max-steps", str(max_steps)]
