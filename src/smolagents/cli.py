@@ -18,7 +18,6 @@ import argparse
 import importlib.resources
 import json
 import os
-import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -503,15 +502,6 @@ def _process_secb_instance(
 
         # Collect artifacts
         _collect_artifacts(instance, instance_output_dir, task_type, runtime)
-
-        # Copy meta.json from container's artifacts directory if it exists
-        # Note: artifacts_dir is set to instance_output_dir
-        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "artifacts"
-        # /app/artifacts is mounted to artifacts_subdir
-        meta_json_source = instance_output_dir / "artifacts" / "meta.json"
-        if meta_json_source.exists():
-            meta_json_dest = instance_output_dir / "meta.json"
-            shutil.copy2(meta_json_source, meta_json_dest)
 
         # Save result
         _save_result(instance_id, instance_output_dir, output_dir, exit_code, task_type)
