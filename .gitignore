@@ -153,3 +153,6 @@ tool_output/
 
 # Gradio runtime
 .gradio/
+
+# config.toml
+config.toml
