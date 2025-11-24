@@ -14,7 +14,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .local_python_executor import (
@@ -47,10 +49,20 @@ class PythonInterpreterTool(Tool):
     output_type = "string"
 
     def __init__(self, *args, authorized_imports=None, **kwargs):
-        if authorized_imports is None:
+        import os
+
+        # Check if running in SEC-bench context (Docker container)
+        # When running with secb-run, sandbox checks are disabled since everything runs in Docker
+        is_secb_run = os.getenv("SMOLAGENTS_SECB_RUN", "").lower() in ("1", "true", "yes")
+
+        if is_secb_run:
+            # Disable sandbox checks by allowing all imports
+            self.authorized_imports = ["*"]
+        elif authorized_imports is None:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES))
         else:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(authorized_imports))
+
         self.inputs = {
             "code": {
                 "type": "string",
@@ -635,12 +647,75 @@ class SpeechToTextTool(PipelineTool):
         return self.pre_processor.batch_decode(outputs, skip_special_tokens=True)[0]
 
 
+class CmdTool(Tool):
+    name = "cmd"
+    description = "Execute a shell command inside the current environment and return stdout, stderr, and exit code."
+    inputs = {
+        "command": {
+            "type": "string",
+            "description": "The shell command to execute (will be run via bash -lc).",
+        },
+        "base_dir": {
+            "type": "string",
+            "description": "Optional base directory to run the command in.",
+            "nullable": True,
+        },
+        "timeout": {
+            "type": "integer",
+            "description": "Optional timeout in seconds (default 120).",
+            "nullable": True,
+        },
+    }
+    output_type = "string"
+
+    def forward(self, command: str, base_dir: str | None = None, timeout: int | None = None) -> str:
+        try:
+            cwd = None
+            if base_dir:
+                p = Path(base_dir)
+                if not p.exists() or not p.is_dir():
+                    return f"Error: base_dir does not exist or is not a directory: {base_dir}"
+                cwd = str(p)
+            timeout_sec = 120 if (timeout is None or int(timeout) <= 0 or int(timeout) > 600) else int(timeout)
+            completed = subprocess.run(
+                ["bash", "-lc", command],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                timeout=timeout_sec,
+            )
+            if completed.returncode == 0:
+                return (completed.stdout or "").rstrip("\n")
+            else:
+                return (completed.stderr or "").rstrip("\n")
+        except subprocess.TimeoutExpired:
+            return f"Timed out after {timeout_sec}s"
+        except FileNotFoundError:
+            # Fallback if bash is not available
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                    cwd=cwd,
+                    timeout=timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                return f"Timed out after {timeout_sec}s"
+            if completed.returncode == 0:
+                return (completed.stdout or "").rstrip("\n")
+            else:
+                return (completed.stderr or "").rstrip("\n")
+
+
 TOOL_MAPPING = {
     tool_class.name: tool_class
     for tool_class in [
         PythonInterpreterTool,
         DuckDuckGoSearchTool,
         VisitWebpageTool,
+        CmdTool,
     ]
 }
 
@@ -655,4 +730,5 @@ __all__ = [
     "VisitWebpageTool",
     "WikipediaSearchTool",
     "SpeechToTextTool",
+    "CmdTool",
 ]
