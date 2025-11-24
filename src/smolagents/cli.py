@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import importlib.resources
 import json
 import os
 import shutil
@@ -23,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Template
 
 
 try:
@@ -524,14 +525,6 @@ def _process_secb_instance(
 
 def _create_task_prompt(instance: dict[str, Any], task_type: str) -> str:
     """Create task prompt based on task type using Jinja2 templates."""
-    # Find prompts directory relative to this file
-    prompts_dir = Path(__file__).parent.parent.parent / "prompts"
-    if not prompts_dir.exists():
-        raise FileNotFoundError(f"Prompts directory not found: {prompts_dir}")
-
-    # Load Jinja2 environment
-    env = Environment(loader=FileSystemLoader(str(prompts_dir)))
-
     # Map task types to template files
     template_map = {
         "patch": "patch.j2",
@@ -544,7 +537,16 @@ def _create_task_prompt(instance: dict[str, Any], task_type: str) -> str:
     if not template_name:
         raise ValueError(f"Unknown task type: {task_type}")
 
-    template = env.get_template(template_name)
+    # Load template from package resources
+    try:
+        template_content = importlib.resources.files("smolagents.prompts").joinpath(template_name).read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError) as e:
+        raise FileNotFoundError(
+            f"Template file '{template_name}' not found in smolagents.prompts package. "
+            f"Make sure the package is properly installed. Original error: {e}"
+        ) from e
+
+    template = Template(template_content)
 
     # Prepare context variables
     context = {

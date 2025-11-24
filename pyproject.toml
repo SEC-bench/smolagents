@@ -138,7 +138,7 @@ known-first-party = ["smolagents"]
 lines-after-imports = 2
 
 [tool.setuptools.package-data]
-"smolagents.prompts" = ["*.yaml"]
+"smolagents.prompts" = ["*.yaml", "*.j2"]
 
 [project.scripts]
 smolagent = "smolagents.cli:main"
