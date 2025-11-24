@@ -539,7 +539,9 @@ def _create_task_prompt(instance: dict[str, Any], task_type: str) -> str:
 
     # Load template from package resources
     try:
-        template_content = importlib.resources.files("smolagents.prompts").joinpath(template_name).read_text(encoding="utf-8")
+        template_content = (
+            importlib.resources.files("smolagents.prompts").joinpath(template_name).read_text(encoding="utf-8")
+        )
     except (FileNotFoundError, ModuleNotFoundError) as e:
         raise FileNotFoundError(
             f"Template file '{template_name}' not found in smolagents.prompts package. "

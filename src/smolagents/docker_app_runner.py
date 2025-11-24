@@ -129,14 +129,12 @@ def _write_meta_json(artifacts_dir: str, agent: Union[ToolCallingAgent, CodeAgen
 
         # Write meta.json using Path.write_text (more robust)
         meta_path = out_dir / "meta.json"
-        meta_path.write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=False),
-            encoding="utf-8"
-        )
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=False), encoding="utf-8")
 
     except Exception as e:
         # Log warning but don't fail the entire run
         import traceback
+
         print(f"Warning: failed to write meta.json: {e}", file=sys.stderr)
         print(traceback.format_exc(), file=sys.stderr)
 
