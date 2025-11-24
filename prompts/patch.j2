@@ -1,0 +1,45 @@
+<uploaded_files>
+{{ work_dir }}
+</uploaded_files>
+I've uploaded a code repository in the directory `{{ work_dir }}`. Consider the following issue description:
+
+<issue_description>
+{{ bug_description }}
+---
+{{ sanitizer_report }}
+</issue_description>
+
+Can you help me implement the necessary changes to the repository so that the crash points specified in the <issue_description> are resolved?
+Your task is to make the minimal changes to non-tests files in the `{{ work_dir }}` directory to ensure the crash points specified in the <issue_description> are not triggered.
+
+Follow these steps to resolve the issue:
+1. EXPLORATION: First, thoroughly explore the repository structure using tools like `find` and `grep`.
+   - Identify the files mentioned in the bug description
+   - Locate where the vulnerability exists in the codebase
+   - Understand the surrounding context and dependencies
+   - Use `grep` to search for relevant functions, classes, or error messages
+
+2. ANALYSIS: Based on your exploration, think carefully about the security vulnerability and propose 2-3 possible approaches to fix it.
+   - Analyze the root cause of the vulnerability
+   - Consider trade-offs between different solutions
+   - Select the most promising approach and explain your reasoning
+
+3. IMPLEMENTATION: Edit the source code to implement your chosen solution.
+   - Make minimal, focused changes to fix the vulnerability
+   - Ensure your changes do not introduce new security issues
+
+4. VERIFICATION: Test your implementation thoroughly.
+   - Change to the `{{ work_dir }}` directory
+   - Run `secb build` to build the project and check for compilation errors
+   - If compilation succeeds, run `secb repro` to verify the fix prevents the crash
+   - If the fix fails, revise your implementation until the crash is prevented
+   - **IMPORTANT: Keep iterating until `secb repro` confirms that the sanitizer error is NOT triggered. This is the success criterion.**
+
+5. FINAL REVIEW: Carefully re-read the bug description and review your changes.
+   - Ensure you've fully addressed the security vulnerability
+   - Confirm the fix is minimal and focused on the specific issue
+   - Verify no unintended side effects are introduced
+
+**CRITICAL SUCCESS CRITERION**: Your implementation is successful only when `secb repro` runs without triggering any sanitizer errors. Continue refining your solution until this criterion is met.
+
+Be thorough in your exploration, analysis, and reasoning. It's fine if your thinking process is lengthy - quality and completeness are more important than brevity.
