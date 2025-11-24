@@ -15,7 +15,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import json
 import os
+import shutil
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from jinja2 import Environment, FileSystemLoader
+
+
+try:
+    import tomli
+except ImportError:
+    try:
+        import tomllib as tomli  # type: ignore  # Python 3.11+
+    except ImportError:
+        raise ImportError("Please install 'tomli' package: pip install tomli")
+
+# datasets is imported lazily in run_secb_evaluation to avoid import errors when not using secb-run
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -35,6 +54,8 @@ from smolagents import (
     TransformersModel,
 )
 from smolagents.default_tools import TOOL_MAPPING
+from smolagents.monitoring import AgentLogger, LogLevel
+from smolagents.remote_executors import DockerAgentRuntime
 
 
 console = Console()
@@ -104,6 +125,15 @@ def parse_arguments():
         type=str,
         help="The API key for the model",
     )
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    # SEC-bench batch runner
+    secbench = subparsers.add_parser("secb-run", help="Run multiple SEC-bench instances across Docker images")
+    secbench.add_argument("--config", required=True, help="Local path to agent config TOML file")
+    secbench.add_argument("--output-dir", help="Output directory for evaluation results")
+    secbench.add_argument("--num-workers", type=int, default=1, help="Number of parallel workers")
+    secbench.add_argument("--instance-id", help="Run evaluation for a specific instance ID only")
+
     return parser.parse_args()
 
 
@@ -245,7 +275,7 @@ def run_smolagent(
                 raise ValueError(f"Tool {tool_name} is not recognized either as a default tool or a Space.")
 
     if action_type == "code":
-        agent = CodeAgent(
+        agent: CodeAgent | ToolCallingAgent = CodeAgent(
             tools=available_tools,
             model=model,
             additional_authorized_imports=imports,
@@ -259,8 +289,409 @@ def run_smolagent(
     agent.run(prompt)
 
 
+def run_secb_evaluation(args) -> None:
+    """Run SEC-bench evaluation using Docker containers."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    load_dotenv()
+
+    # Load TOML config
+    config_path = Path(args.config)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with config_path.open("rb") as f:
+        config = tomli.load(f)
+
+    # Extract configuration
+    dataset_config = config.get("dataset", {})
+    docker_config = config.get("docker", {})
+    task_config = config.get("task", {})
+    output_config = config.get("output", {})
+
+    # Load dataset - import datasets lazily to avoid import errors when not using secb-run
+    try:
+        from datasets import load_dataset  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "Please install 'datasets' package for SEC-bench evaluation: pip install 'smolagents[secb]'"
+        ) from e
+
+    dataset_name = dataset_config.get("name", "SEC-bench/SEC-bench")
+    dataset_split = dataset_config.get("split", "eval")  # eval, cve, or oss
+    selected_ids = dataset_config.get("instance_ids", [])
+
+    console.print(f"[bold]Loading dataset: {dataset_name} (split: {dataset_split})[/]")
+    dataset = load_dataset(dataset_name, split=dataset_split)
+
+    # Filter by instance IDs if specified
+    if selected_ids:
+        dataset = dataset.filter(lambda x: x["instance_id"] in selected_ids)
+        console.print(f"[bold]Filtered to {len(selected_ids)} instance(s)[/]")
+
+    # Filter by specific instance_id if provided via CLI
+    if args.instance_id:
+        dataset = dataset.filter(lambda x: x["instance_id"] == args.instance_id)
+        console.print(f"[bold]Running for instance: {args.instance_id}[/]")
+
+    # Convert to list for easier processing
+    instances = list(dataset)
+
+    if not instances:
+        console.print("[bold red]No instances found matching the criteria[/]")
+        return
+
+    console.print(f"[bold green]Found {len(instances)} instance(s) to evaluate[/]")
+
+    # Setup output directory with timestamp-based subdirectory
+    # Priority: CLI arg > config file > default
+    base_output_dir = (
+        Path(args.output_dir) if args.output_dir else Path(output_config.get("output_dir", "./secb_results"))
+    )
+    # Create timestamp-based subdirectory for this run session
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = base_output_dir / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"[bold]Output directory: {output_dir}[/]")
+
+    # Process instances
+    if args.num_workers <= 1:
+        # Sequential processing
+        for instance in instances:
+            _process_secb_instance(
+                instance,
+                config,
+                output_dir,
+                docker_config,
+                task_config,
+            )
+    else:
+        # Parallel processing
+        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_secb_instance,
+                    instance,
+                    config,
+                    output_dir,
+                    docker_config,
+                    task_config,
+                ): instance
+                for instance in instances
+            }
+            for future in as_completed(futures):
+                instance = futures[future]
+                try:
+                    future.result()
+                    console.print(f"[green]Completed: {instance['instance_id']}[/]")
+                except Exception as e:
+                    console.print(f"[red]Failed {instance['instance_id']}: {e}[/]")
+
+
+def _process_secb_instance(
+    instance: dict[str, Any],
+    config: dict[str, Any],
+    output_dir: Path,
+    docker_config: dict[str, Any],
+    task_config: dict[str, Any],
+) -> None:
+    """Process a single SEC-bench instance."""
+    instance_id = instance["instance_id"]
+    task_type = task_config.get("type", "patch")  # patch, poc-repo, poc-desc, poc-san
+
+    console.print(f"[bold]Processing instance: {instance_id} (task: {task_type})[/]")
+
+    # Create task prompt
+    task_prompt = _create_task_prompt(instance, task_type)
+
+    # Create agent config JSON
+    agent_config_json = _create_agent_config_json(config)
+
+    # Create temporary directory for this instance
+    instance_output_dir = output_dir / instance_id
+    instance_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine Docker image name
+    image_prefix = docker_config.get("image_prefix", "hwiwonlee/secb.eval.x86_64")
+    image_tag = "poc" if task_type.startswith("poc") else "patch"
+    docker_image = f"{image_prefix}.{instance_id}:{image_tag}"
+
+    # Create logger
+    logger = AgentLogger(level=LogLevel.INFO)
+
+    # Setup Docker runtime
+    docker_kwargs = docker_config.get("run_kwargs", {})
+    docker_kwargs.setdefault("mem_limit", "8g")
+    docker_kwargs.setdefault("network_mode", "host")
+    docker_kwargs.setdefault("auto_remove", True)
+
+    # Use work_dir from instance as default workdir, fallback to /app if not present
+    workdir = instance.get("work_dir", "/app")
+
+    runtime = DockerAgentRuntime(
+        image_name=docker_image,
+        workdir=workdir,
+        artifacts_dir=str(instance_output_dir / "output"),
+        runtime_logger=logger,
+        docker_run_kwargs=docker_kwargs,
+    )
+
+    try:
+        # Start container
+        runtime.start()
+
+        # Install local smolagents source to ensure CmdTool and other local changes are available
+        # Find the repository root (assuming cli.py is in src/smolagents/)
+        repo_root = Path(__file__).parent.parent.parent
+        runtime.install_local_smolagents(str(repo_root))
+
+        # Copy runner script from source directory
+        runner_script_path = Path(__file__).parent / "docker_app_runner.py"
+        if not runner_script_path.exists():
+            raise FileNotFoundError(f"Runner script not found: {runner_script_path}")
+        runtime.copy_into_container(str(runner_script_path), "/app/runner.py")
+
+        # Copy agent config
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(agent_config_json, f)
+            agent_config_path = f.name
+
+        runtime.copy_into_container(agent_config_path, "/app/agent_config.json")
+        os.unlink(agent_config_path)
+
+        # Copy task
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(task_prompt)
+            task_path = f.name
+
+        runtime.copy_into_container(task_path, "/app/task.txt")
+        os.unlink(task_path)
+
+        # Set environment variables
+        # Pass API keys from config to container environment
+        model_config = config.get("model", {})
+        env_vars = {
+            "SMOLAGENTS_CONFIG_PATH": "/app/agent_config.json",
+            "SMOLAGENTS_TASK_PATH": "/app/task.txt",
+            "SMOLAGENTS_ARTIFACTS_DIR": "/app/artifacts",
+            "SMOLAGENTS_SECB_RUN": "1",  # Disable sandbox checks for SEC-bench (runs in Docker)
+        }
+
+        # Add API keys to environment if provided in config
+        if api_key := model_config.get("api_key"):
+            # Set appropriate environment variable based on model type
+            model_type = model_config.get("type", "")
+            if model_type == "InferenceClientModel":
+                env_vars["HF_API_KEY"] = api_key
+            elif model_type in ["OpenAIModel", "LiteLLMModel"]:
+                env_vars["OPENAI_API_KEY"] = api_key
+
+        runtime.environment.update(env_vars)
+
+        # Run agent
+        timeout_seconds = task_config.get("timeout_seconds", 7200)  # 2 hours default
+        # The runner script reads config and task from environment variables
+        exit_code = runtime.run_agent(
+            agent_runner_path_in_container="/app/runner.py",
+            agent_config_path_in_container="/app/agent_config.json",
+            task=task_prompt,
+            max_steps=config.get("agent", {}).get("max_steps", 20),
+            timeout_seconds=timeout_seconds,
+            stream=True,
+        )
+
+        # Collect artifacts
+        _collect_artifacts(instance, instance_output_dir, task_type, runtime)
+
+        # Copy meta.json from container's artifacts directory if it exists
+        # Note: artifacts_dir is set to instance_output_dir / "output"
+        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "output" / "artifacts"
+        # /app/artifacts is mounted to artifacts_subdir
+        meta_json_source = instance_output_dir / "output" / "artifacts" / "meta.json"
+        if meta_json_source.exists():
+            meta_json_dest = instance_output_dir / "meta.json"
+            shutil.copy2(meta_json_source, meta_json_dest)
+
+        # Save result
+        _save_result(instance_id, instance_output_dir, exit_code, task_type)
+
+    except Exception as e:
+        console.print(f"[red]Error processing {instance_id}: {e}[/]")
+        raise
+    finally:
+        runtime.cleanup()
+
+
+def _create_task_prompt(instance: dict[str, Any], task_type: str) -> str:
+    """Create task prompt based on task type using Jinja2 templates."""
+    # Find prompts directory relative to this file
+    prompts_dir = Path(__file__).parent.parent.parent / "prompts"
+    if not prompts_dir.exists():
+        raise FileNotFoundError(f"Prompts directory not found: {prompts_dir}")
+
+    # Load Jinja2 environment
+    env = Environment(loader=FileSystemLoader(str(prompts_dir)))
+
+    # Map task types to template files
+    template_map = {
+        "patch": "patch.j2",
+        "poc-repo": "poc-repo.j2",
+        "poc-desc": "poc-desc.j2",
+        "poc-san": "poc-san.j2",
+    }
+
+    template_name = template_map.get(task_type)
+    if not template_name:
+        raise ValueError(f"Unknown task type: {task_type}")
+
+    template = env.get_template(template_name)
+
+    # Prepare context variables
+    context = {
+        "work_dir": instance.get("work_dir", ""),
+        "bug_report": instance.get("bug_report", ""),
+        "bug_description": instance.get("bug_description", ""),
+        "sanitizer_report": instance.get("sanitizer_report", ""),
+    }
+
+    return template.render(**context)
+
+
+def _create_agent_config_json(config: dict[str, Any]) -> dict[str, Any]:
+    """Create agent configuration JSON from TOML config."""
+    return {
+        "model": {
+            "type": config.get("model", {}).get("type", "InferenceClientModel"),
+            "model_id": config.get("model", {}).get("model_id", ""),
+            "api_key": config.get("model", {}).get("api_key"),
+            "api_base": config.get("model", {}).get("api_base"),
+            "provider": config.get("model", {}).get("provider"),
+        },
+        "agent_type": config.get("agent", {}).get("type", "ToolCallingAgent"),
+        "tools": config.get("agent", {}).get("tools", []),
+        "max_steps": config.get("agent", {}).get("max_steps", 20),
+        "verbosity_level": config.get("agent", {}).get("verbosity_level", 1),
+        "additional_imports": config.get("agent", {}).get("additional_imports", []),
+    }
+
+
+def _collect_artifacts(
+    instance: dict[str, Any],
+    instance_output_dir: Path,
+    task_type: str,
+    runtime: DockerAgentRuntime,
+) -> None:
+    """Collect artifacts from container based on task type."""
+    work_dir = instance.get("work_dir", "")
+
+    if runtime.container is None:
+        return
+
+    container = runtime.container
+
+    if task_type == "patch":
+        # Collect git patch - execute git diff and capture output
+        exec_result = container.exec_run(
+            [
+                "bash",
+                "-c",
+                f"cd {work_dir} && git config --global core.pager '' && git add -A && git diff --no-color --cached {instance.get('base_commit', 'HEAD')} '*.c' '*.cpp' '*.h' '*.hpp' '*.cc' '*.hh'",
+            ],
+            workdir=runtime.workdir,
+        )
+        if exec_result.exit_code == 0:
+            patch_content = exec_result.output.decode("utf-8", errors="ignore").strip()
+        else:
+            patch_content = ""
+
+        # Save patch
+        with (instance_output_dir / "git_patch.diff").open("w") as f:
+            f.write(patch_content)
+
+    elif task_type.startswith("poc"):
+        # Collect PoC artifact (base64 encoded tar.gz)
+        # Compress and encode PoC
+        runtime.exec(
+            [
+                "bash",
+                "-c",
+                'tar --exclude="base_commit_hash" -czf /tmp/poc.tar.gz -C /testcase . 2>/dev/null || echo ""',
+            ]
+        )
+
+        # Encode to base64 and save to artifacts directory (which is mounted)
+        exec_result = container.exec_run(
+            [
+                "bash",
+                "-c",
+                "cat /tmp/poc.tar.gz | base64 -w 0 > /app/artifacts/poc.tar.gz.base64 2>/dev/null || echo ''",
+            ],
+            workdir=runtime.workdir,
+        )
+
+        # Read base64 content from mounted artifacts directory
+        # Note: artifacts_dir is set to instance_output_dir / "output"
+        # In remote_executors.py, artifacts_subdir = artifacts_dir / "artifacts" = instance_output_dir / "output" / "artifacts"
+        # /app/artifacts is mounted to artifacts_subdir
+        poc_file = instance_output_dir / "output" / "artifacts" / "poc.tar.gz.base64"
+        if poc_file.exists():
+            with poc_file.open() as f:
+                poc_content = f.read().strip()
+        else:
+            poc_content = ""
+
+        # Save PoC artifact
+        with (instance_output_dir / "poc_artifact.txt").open("w") as f:
+            f.write(poc_content)
+
+
+def _save_result(
+    instance_id: str,
+    instance_output_dir: Path,
+    exit_code: int,
+    task_type: str,
+) -> None:
+    """Save evaluation result in compatible format."""
+    result: dict[str, Any] = {
+        "instance_id": instance_id,
+    }
+
+    if task_type == "patch":
+        # Read git patch
+        patch_file = instance_output_dir / "git_patch.diff"
+        git_patch: str = ""
+        if patch_file.exists():
+            with patch_file.open() as f:
+                git_patch = f.read()
+
+        result["test_result"] = {
+            "git_patch": git_patch,
+        }
+    else:  # poc tasks
+        # Read PoC artifact
+        poc_file = instance_output_dir / "poc_artifact.txt"
+        poc_artifact: str = ""
+        if poc_file.exists():
+            with poc_file.open() as f:
+                poc_artifact = f.read().strip()
+
+        result["test_result"] = {
+            "poc_artifact": poc_artifact,
+        }
+
+    # Save as JSONL (compatible with eval_instances.py)
+    output_file = instance_output_dir / "output.jsonl"
+    with output_file.open("w") as f:
+        f.write(json.dumps(result) + "\n")
+
+
 def main() -> None:
     args = parse_arguments()
+
+    # Handle secb-run subcommand
+    if args.subcommand == "secb-run":
+        run_secb_evaluation(args)
+        return
 
     # Check if we should run in interactive mode
     # Interactive mode is triggered when no prompt is provided
